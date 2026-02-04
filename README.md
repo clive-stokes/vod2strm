@@ -2,6 +2,8 @@
 
 A high-performance Dispatcharr plugin that exports your VOD library (Movies and Series/Episodes) into a structured filesystem of `.strm` and `.nfo` files for Plex, Emby, Jellyfin, or Kodi.
 
+> **Fork note** — this is a fork of [cmc0619/vod2strm](https://github.com/cmc0619/vod2strm). Changes from upstream are tracked under version `0.0.13-fork.*`. See the [Fork Changes](#fork-changes) section below for a full diff summary.
+
 ## Overview
 
 vod2strm transforms Dispatcharr's VOD database into media server-compatible `.strm` files without duplicating content. It runs entirely inside Dispatcharr using the Django ORM for performance and Celery for background jobs. If Celery isn't available, it gracefully falls back to background threads.
@@ -32,20 +34,31 @@ vod2strm transforms Dispatcharr's VOD database into media server-compatible `.st
 
 ## Output Structure
 
+Movies and series are organised first by provider category (e.g. `EN - Action`), then by title. Folder names include a `{tmdb-XXXXX}` suffix when a TMDB ID is available — Jellyfin uses this for instant metadata matching without an API call.
+
 ```
 /data/STRM/
 ├── Movies/
-│   └── Movie Name (2023)/
-│       ├── Movie Name (2023).strm
-│       └── movie.nfo
+│   ├── EN - Action/
+│   │   └── Movie Name (2023) {tmdb-12345}/
+│   │       ├── Movie Name (2023) {tmdb-12345}.strm
+│   │       └── movie.nfo
+│   └── Uncategorised/
+│       └── Another Movie (2022)/
+│           ├── Another Movie (2022).strm
+│           └── movie.nfo
 └── TV/
-    └── Series Name (2021)/
-        ├── Season 01/
-        │   ├── S01E01 - Episode Title.strm
-        │   ├── S01E01.nfo
-        │   └── season.nfo
-        └── Season 00 (Specials)/
-            └── S00E01 - Special Title.strm
+    ├── EN - Drama/
+    │   └── Series Name (2021) {tmdb-67890}/
+    │       ├── tvshow.nfo
+    │       ├── Season 01/
+    │       │   ├── season.nfo
+    │       │   ├── S01E01 - Episode Title.strm
+    │       │   └── S01E01.nfo
+    │       └── Season 00 (Specials)/
+    │           └── S00E01 - Special Title.strm
+    └── Uncategorised/
+        └── ...
 ```
 
 ## Settings
@@ -175,7 +188,54 @@ Adaptive throttle: NAS slow (avg 0.350s), reducing workers 4 → 3
 ## Versioning
 
 Semantic versioning: `MAJOR.MINOR.PATCH`
-- Current: `0.0.10`
+
+- Upstream: `0.0.13` ([cmc0619/vod2strm](https://github.com/cmc0619/vod2strm))
+- This fork: `0.0.13-fork.1`
+
+---
+
+## Fork Changes
+
+Everything below documents what this fork adds on top of upstream `0.0.13`. All changes are confined to `plugin.py`.
+
+### Category directories in output paths
+
+Movies and series are now grouped under their Dispatcharr provider category (the `VODCategory.name` field from `M3UMovieRelation` / `M3USeriesRelation`). The category name is filesystem-safe via `_norm_fs_name`. Content with no category falls into `Uncategorised/`.
+
+### TMDB folder-name suffix
+
+When a valid TMDB ID is available, folder names (and the `.strm` file inside) get a `{tmdb-XXXXX}` suffix. Jellyfin recognises this format and skips its own metadata lookup, which speeds up library scans and avoids mismatches on common titles.
+
+### Full NFO metadata
+
+NFO output was expanded well beyond the upstream title/plot/year stub:
+
+| Element | Source |
+| --- | --- |
+| `<outline>` | First 200 characters of plot |
+| `<runtime>` | `duration_secs // 60` |
+| `<genre>` (×N) | `Movie.genre` / `Series.genre` split on `,` and `/` |
+| `<director>` | `custom_properties.director` |
+| `<actor><name>` (×N) | `custom_properties.actors` (movies) / `custom_properties.cast` (series), comma-separated |
+| `<ratings><rating name="tmdb">` | `Movie.rating` / `Series.rating` (numeric) |
+| `<uniqueid type="imdb">` | `Movie.imdb_id` / `Series.imdb_id` |
+| `<thumb>` | `VODLogo.url` (fixed: upstream used `str(logo)` which returned the name, not the URL) |
+| `<showtitle>` | Series name on episode NFOs |
+| `<fileinfo><streamdetails>` | Video and audio stream info from `custom_properties.detailed_info` — codec, resolution, aspect ratio, bitrate, channels, sample rate |
+
+### Stream-details key mapping
+
+Dispatcharr stores ffprobe output in `detailed_info` using ffprobe key names (`codec_name`, `display_aspect_ratio`, `bit_rate` in bits/sec, `channel_layout`). The upstream code guessed simpler names. The fork maps correctly and converts `bit_rate` from bits/sec to kbps for the NFO.
+
+### Query additions
+
+- `duration_secs` and `custom_properties` added to `.only()` on Movie and Episode queries.
+- `custom_properties` added to `.only()` on Series queries.
+- `select_related('category')` added to relation prefetch querysets so category names are fetched in the same query, not N+1.
+
+### Logo URL fix
+
+`_logo_url()` helper extracts `VODLogo.url` correctly. Upstream called `str(logo)` which hit `VODLogo.__str__` and returned the logo name instead of its URL.
 
 ## License
 
@@ -183,4 +243,4 @@ MIT / Public Domain — use freely, attribution appreciated.
 
 ---
 
-**Made for Dispatcharr** | Report issues on GitHub
+**Made for Dispatcharr** | Upstream: [cmc0619/vod2strm](https://github.com/cmc0619/vod2strm)

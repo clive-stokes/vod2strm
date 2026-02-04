@@ -1,20 +1,24 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.13
+Version: 0.0.13-fork.1
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
 - Buttons: Stats, Generate Movies, Generate Series, Generate All.
 - STRM generation:
-  * Movies -> <root>/Movies/{Name} ({Year})/{Name} ({Year}).strm
-  * Series -> <root>/TV/{SeriesName (Year) or SeriesName + (year)}/Season {SS or 00}/S{SS}E{EE} - {Title}.strm
+  * Movies -> <root>/Movies/{Category}/{Name} ({Year}) {tmdb-ID}/{Name} ({Year}) {tmdb-ID}.strm
+  * Series -> <root>/TV/{Category}/{SeriesName (Year)} {tmdb-ID}/Season {SS}/S{SS}E{EE} - {Title}.strm
   * Season 00 labeled "Season 00 (Specials)".
+  * {tmdb-ID} suffix omitted when no valid TMDB ID available.
   * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}?stream_id={stream_id}
-- NFO generation (compare-before-write):
-  * Movies: movie.nfo in movie folder
+- NFO generation (compare-before-write, full Jellyfin/Kodi metadata):
+  * Movies: movie.nfo — title, plot, outline, year, runtime, genres, director, cast,
+    ratings block, TMDB+IMDB IDs, thumb, video/audio streamdetails
+  * TV shows: tvshow.nfo — title, plot, year, genres, director, cast, ratings, IDs, thumb
   * Seasons: season.nfo per season folder
-  * Episodes: SxxExx.nfo next to episode file
-- Cleanup (preview/apply) of stale files/folders.
+  * Episodes: SxxExx.nfo — title, showtitle, season/episode, runtime, plot, ratings, IDs, streamdetails
+- Category directories sourced from M3UMovieRelation / M3USeriesRelation category FK.
+- Cleanup (preview/apply) of stale files/folders (auto-prunes empty category dirs).
 - CSV reports -> /data/plugins/vod2strm/reports/
 - Robust debug logging -> /data/plugins/vod2strm/logs/
 """
@@ -477,31 +481,34 @@ def _season_folder_name(season_number: int) -> str:
     return f"Season {season_number:02d}"
 
 
-def _series_folder_name(name: str, year: int | None) -> str:
+def _series_folder_name(name: str, year: int | None, tmdb_id=None) -> str:
     # Avoid double "(YYYY)" if already present and matches DB year
     year_suffix = re.search(r"\((\d{4})\)\s*$", name or "")
     if year and year_suffix and int(year_suffix.group(1)) == int(year):
-        return _norm_fs_name(name)
-    if year:
-        return _norm_fs_name(f"{name} ({year})")
-    return _norm_fs_name(name or "Unknown Series")
+        base = _norm_fs_name(name)
+    elif year:
+        base = _norm_fs_name(f"{name} ({year})")
+    else:
+        base = _norm_fs_name(name or "Unknown Series")
+    tmdb = _valid_tmdb_id(tmdb_id)
+    return f"{base} {{tmdb-{tmdb}}}" if tmdb else base
 
 
-def _movie_folder_name(name: str, year: int | None) -> str:
+def _movie_folder_name(name: str, year: int | None, tmdb_id=None) -> str:
     """
     Generate folder name for movie.
     Strips any existing (YYYY) pattern from name to avoid duplication when adding year.
+    Appends {tmdb-XXXXX} when a valid TMDB ID is provided.
     """
     if not name:
         name = "Unknown Movie"
 
     # Strip trailing (YYYY) pattern if present to avoid duplication
-    # Example: "The Matrix (1999)" -> "The Matrix"
     name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
 
-    if year:
-        return _norm_fs_name(f"{name} ({year})")
-    return _norm_fs_name(name)
+    base = _norm_fs_name(f"{name} ({year})") if year else _norm_fs_name(name)
+    tmdb = _valid_tmdb_id(tmdb_id)
+    return f"{base} {{tmdb-{tmdb}}}" if tmdb else base
 
 
 def _hash_bytes(b: bytes) -> str:
@@ -591,33 +598,194 @@ def _xml_escape(text: str | None) -> str:
     return xml_escape(text).replace('"', "&quot;").replace("'", "&apos;")
 
 
+# -------------------- NFO Helpers --------------------
+
+
+def _valid_tmdb_id(tmdb_id) -> str | None:
+    """Return tmdb_id as string if valid (non-zero, non-null), else None."""
+    if not tmdb_id:
+        return None
+    s = str(tmdb_id).strip()
+    if s.lower() in ("", "0", "null", "none"):
+        return None
+    try:
+        if int(s) <= 0:
+            return None
+    except ValueError:
+        pass
+    return s
+
+
+def _split_genres(genre_str: str) -> List[str]:
+    """Split a genre string on commas and/or slashes, return deduplicated list."""
+    if not genre_str:
+        return []
+    parts = re.split(r'[,/]', genre_str)
+    seen: set[str] = set()
+    result: List[str] = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+def _extract_stream_details(relation) -> Dict[str, Any]:
+    """
+    Extract video/audio stream details from a relation's custom_properties.
+    Dispatcharr stores provider-fetched info under custom_properties['detailed_info'].
+    Returns dict with 'video', 'audio', 'bitrate' keys.
+    """
+    if not relation:
+        return {}
+    props = getattr(relation, 'custom_properties', None) or {}
+    detailed = props.get('detailed_info') or {}
+    # detailed_info may wrap data under an 'info' sub-key
+    info = detailed.get('info') or detailed
+    return {
+        'video': info.get('video') or {},
+        'audio': info.get('audio') or {},
+        'bitrate': info.get('bitrate') or 0,
+    }
+
+
+def _nfo_streamdetails(stream_info: Dict[str, Any], duration_secs: int | None = None) -> str:
+    """Generate <fileinfo><streamdetails> XML block. Returns empty string if no data."""
+    video = stream_info.get('video') or {}
+    audio = stream_info.get('audio') or {}
+    if not video and not audio:
+        return ""
+    xml = io.StringIO()
+    xml.write("  <fileinfo>\n    <streamdetails>\n")
+    if video:
+        xml.write("      <video>\n")
+        v_codec = video.get('codec_name') or video.get('codec')
+        if v_codec:
+            xml.write(f"        <codec>{_xml_escape(str(v_codec))}</codec>\n")
+        if video.get('width'):
+            xml.write(f"        <width>{video['width']}</width>\n")
+        if video.get('height'):
+            xml.write(f"        <height>{video['height']}</height>\n")
+        v_aspect = video.get('display_aspect_ratio') or video.get('aspect')
+        if v_aspect:
+            xml.write(f"        <aspect>{_xml_escape(str(v_aspect))}</aspect>\n")
+        dur = video.get('duration') or duration_secs
+        if dur:
+            xml.write(f"        <durationinseconds>{dur}</durationinseconds>\n")
+        v_bitrate = None
+        if video.get('bit_rate'):
+            try:
+                v_bitrate = int(video['bit_rate']) // 1000
+            except (ValueError, TypeError):
+                pass
+        if not v_bitrate and stream_info.get('bitrate'):
+            v_bitrate = stream_info['bitrate']
+        if v_bitrate:
+            xml.write(f"        <bitrate>{v_bitrate}</bitrate>\n")
+        xml.write("      </video>\n")
+    if audio:
+        xml.write("      <audio>\n")
+        a_codec = audio.get('codec_name') or audio.get('codec')
+        if a_codec:
+            xml.write(f"        <codec>{_xml_escape(str(a_codec))}</codec>\n")
+        a_channels = audio.get('channel_layout') or audio.get('channels')
+        if a_channels:
+            xml.write(f"        <channels>{a_channels}</channels>\n")
+        sr = audio.get('sample_rate') or audio.get('samplerate')
+        if sr:
+            xml.write(f"        <samplerate>{sr}</samplerate>\n")
+        a_bitrate = None
+        if audio.get('bit_rate'):
+            try:
+                a_bitrate = int(audio['bit_rate']) // 1000
+            except (ValueError, TypeError):
+                pass
+        if a_bitrate:
+            xml.write(f"        <bitrate>{a_bitrate}</bitrate>\n")
+        if audio.get('language'):
+            xml.write(f"        <language>{_xml_escape(str(audio['language']))}</language>\n")
+        xml.write("      </audio>\n")
+    xml.write("    </streamdetails>\n  </fileinfo>\n")
+    return xml.getvalue()
+
+
+def _logo_url(obj) -> str | None:
+    """Safely extract logo URL from a model instance with a VODLogo FK."""
+    logo = getattr(obj, "logo", None)
+    if not logo:
+        return None
+    return getattr(logo, "url", None) or str(logo)
+
+
 # -------------------- NFO Builders --------------------
 
-def _nfo_movie(m: Movie, clean_name: str | None = None) -> bytes:
-    # Use name field - title field doesn't exist in Movie model
-    # Use clean_name if provided (for title tag), otherwise fall back to DB name
+def _nfo_movie(m: Movie, clean_name: str | None = None, relation: M3UMovieRelation | None = None) -> bytes:
     title = clean_name if clean_name else (m.name or "")
-    fields = {
-        "title": title,
-        "plot": getattr(m, "description", "") or "",
-        "year": str(getattr(m, "year", "") or ""),
-        "rating": str(getattr(m, "rating", "") or ""),
-        "genre": getattr(m, "genre", "") or "",
-        "uniqueid_tmdb": str(getattr(m, "tmdb_id", "") or ""),
-        "uniqueid_imdb": str(getattr(m, "imdb_id", "") or ""),
-    }
+    props = getattr(m, 'custom_properties', None) or {}
+    description = getattr(m, "description", "") or ""
+    duration_secs = getattr(m, "duration_secs", None)
+
     xml = io.StringIO()
+    xml.write('<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n')
     xml.write("<movie>\n")
-    for tag, val in fields.items():
-        if val:
-            if tag.startswith("uniqueid_"):
-                typ = tag.split("_", 1)[1]
-                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
-            else:
-                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
-    logo = getattr(m, "logo", None)
-    if logo:
-        xml.write(f"  <thumb>{_xml_escape(str(logo))}</thumb>\n")
+
+    # Title
+    xml.write(f"  <title>{_xml_escape(title)}</title>\n")
+
+    # Plot + outline
+    if description:
+        xml.write(f"  <plot>{_xml_escape(description)}</plot>\n")
+        xml.write(f"  <outline>{_xml_escape(description[:200])}</outline>\n")
+
+    # Year
+    year = str(getattr(m, "year", "") or "")
+    if year:
+        xml.write(f"  <year>{year}</year>\n")
+
+    # Runtime (minutes)
+    if duration_secs:
+        xml.write(f"  <runtime>{duration_secs // 60}</runtime>\n")
+
+    # Genres — one <genre> per value, split on comma/slash
+    for genre in _split_genres(getattr(m, "genre", "") or ""):
+        xml.write(f"  <genre>{_xml_escape(genre)}</genre>\n")
+
+    # Director
+    director = props.get('director') or ""
+    if director:
+        xml.write(f"  <director>{_xml_escape(director)}</director>\n")
+
+    # Cast
+    actors_str = props.get('actors') or ""
+    if actors_str:
+        for actor in [a.strip() for a in actors_str.split(',') if a.strip()]:
+            xml.write(f"  <actor>\n    <name>{_xml_escape(actor)}</name>\n  </actor>\n")
+
+    # Ratings block (numeric rating from provider)
+    rating = str(getattr(m, "rating", "") or "")
+    if rating:
+        xml.write(f'  <ratings>\n    <rating name="tmdb" default="true"><value>{_xml_escape(rating)}</value></rating>\n  </ratings>\n')
+
+    # Unique IDs
+    tmdb = _valid_tmdb_id(getattr(m, "tmdb_id", None))
+    if tmdb:
+        xml.write(f'  <uniqueid type="tmdb" default="true">{_xml_escape(tmdb)}</uniqueid>\n')
+    imdb = str(getattr(m, "imdb_id", "") or "")
+    if imdb and imdb.lower() not in ("null", "none"):
+        xml.write(f'  <uniqueid type="imdb">{_xml_escape(imdb)}</uniqueid>\n')
+
+    # Thumb
+    logo_url = _logo_url(m)
+    if logo_url:
+        xml.write(f"  <thumb>{_xml_escape(logo_url)}</thumb>\n")
+
+    # Stream details from relation
+    stream_info = _extract_stream_details(relation)
+    sd_xml = _nfo_streamdetails(stream_info, duration_secs=duration_secs)
+    if sd_xml:
+        xml.write(sd_xml)
+
     xml.write("</movie>\n")
     return xml.getvalue().encode("utf-8")
 
@@ -633,77 +801,147 @@ def _nfo_season(s: Series, season_number: int, clean_series_name: str | None = N
     return xml.getvalue().encode("utf-8")
 
 
-def _nfo_episode(e: Episode, clean_name: str | None = None) -> bytes:
-    # Use clean_name if provided (for title tag), otherwise fall back to DB name
+def _nfo_episode(e: Episode, clean_name: str | None = None, series_name: str | None = None, relation: M3UEpisodeRelation | None = None) -> bytes:
     title = clean_name if clean_name else (e.name or "")
-    fields = {
-        "title": title,
-        "season": str(getattr(e, "season_number", "") or ""),
-        "episode": str(getattr(e, "episode_number", "") or ""),
-        "aired": str(getattr(e, "air_date", "") or ""),
-        "plot": getattr(e, "description", "") or "",
-        "rating": str(getattr(e, "rating", "") or ""),
-        "uniqueid_tmdb": str(getattr(e, "tmdb_id", "") or ""),
-        "uniqueid_imdb": str(getattr(e, "imdb_id", "") or ""),
-    }
+    duration_secs = getattr(e, "duration_secs", None)
+
     xml = io.StringIO()
+    xml.write('<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n')
     xml.write("<episodedetails>\n")
-    for tag, val in fields.items():
-        if val:
-            if tag.startswith("uniqueid_"):
-                typ = tag.split("_", 1)[1]
-                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
-            else:
-                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
+
+    # Title + show title
+    xml.write(f"  <title>{_xml_escape(title)}</title>\n")
+    if series_name:
+        xml.write(f"  <showtitle>{_xml_escape(series_name)}</showtitle>\n")
+
+    # Season / episode numbers
+    season = str(getattr(e, "season_number", "") or "")
+    episode = str(getattr(e, "episode_number", "") or "")
+    if season:
+        xml.write(f"  <season>{season}</season>\n")
+    if episode:
+        xml.write(f"  <episode>{episode}</episode>\n")
+
+    # Runtime (minutes)
+    if duration_secs:
+        xml.write(f"  <runtime>{duration_secs // 60}</runtime>\n")
+
+    # Aired date
+    aired = str(getattr(e, "air_date", "") or "")
+    if aired:
+        xml.write(f"  <aired>{aired}</aired>\n")
+
+    # Plot
+    description = getattr(e, "description", "") or ""
+    if description:
+        xml.write(f"  <plot>{_xml_escape(description)}</plot>\n")
+
+    # Ratings block
+    rating = str(getattr(e, "rating", "") or "")
+    if rating:
+        xml.write(f'  <ratings>\n    <rating name="tmdb" default="true"><value>{_xml_escape(rating)}</value></rating>\n  </ratings>\n')
+
+    # Unique IDs
+    tmdb = _valid_tmdb_id(getattr(e, "tmdb_id", None))
+    if tmdb:
+        xml.write(f'  <uniqueid type="tmdb" default="true">{_xml_escape(tmdb)}</uniqueid>\n')
+    imdb = str(getattr(e, "imdb_id", "") or "")
+    if imdb and imdb.lower() not in ("null", "none"):
+        xml.write(f'  <uniqueid type="imdb">{_xml_escape(imdb)}</uniqueid>\n')
+
+    # Stream details from episode relation (if available)
+    stream_info = _extract_stream_details(relation)
+    sd_xml = _nfo_streamdetails(stream_info, duration_secs=duration_secs)
+    if sd_xml:
+        xml.write(sd_xml)
+
     xml.write("</episodedetails>\n")
     return xml.getvalue().encode("utf-8")
 
 
 def _nfo_tvshow(s: Series, clean_name: str | None = None) -> bytes:
-    """
-    Generate tvshow.nfo for series root directory.
-    Contains series-level metadata for Kodi/Plex/Jellyfin.
-    """
-    # Use clean_name if provided, otherwise fall back to DB name
+    """Generate tvshow.nfo for series root directory."""
     title = clean_name if clean_name else (s.name or "")
-    fields = {
-        "title": title,
-        "plot": getattr(s, "description", "") or "",
-        "year": str(getattr(s, "year", "") or ""),
-        "rating": str(getattr(s, "rating", "") or ""),
-        "genre": getattr(s, "genre", "") or "",
-        "uniqueid_tmdb": str(getattr(s, "tmdb_id", "") or ""),
-        "uniqueid_imdb": str(getattr(s, "imdb_id", "") or ""),
-    }
+    props = getattr(s, 'custom_properties', None) or {}
+    description = getattr(s, "description", "") or ""
+
     xml = io.StringIO()
+    xml.write('<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n')
     xml.write("<tvshow>\n")
-    for tag, val in fields.items():
-        if val:
-            if tag.startswith("uniqueid_"):
-                typ = tag.split("_", 1)[1]
-                xml.write(f'  <uniqueid type="{typ}">{_xml_escape(val)}</uniqueid>\n')
-            else:
-                xml.write(f"  <{tag}>{_xml_escape(val)}</{tag}>\n")
-    logo = getattr(s, "logo", None)
-    if logo:
-        xml.write(f"  <thumb>{_xml_escape(str(logo))}</thumb>\n")
+
+    # Title
+    xml.write(f"  <title>{_xml_escape(title)}</title>\n")
+
+    # Plot
+    if description:
+        xml.write(f"  <plot>{_xml_escape(description)}</plot>\n")
+
+    # Year / premiered
+    year = str(getattr(s, "year", "") or "")
+    if year:
+        xml.write(f"  <year>{year}</year>\n")
+        xml.write(f"  <premiered>{year}</premiered>\n")
+
+    # Genres — split on comma/slash
+    for genre in _split_genres(getattr(s, "genre", "") or ""):
+        xml.write(f"  <genre>{_xml_escape(genre)}</genre>\n")
+
+    # Director
+    director = props.get('director') or ""
+    if director:
+        xml.write(f"  <director>{_xml_escape(director)}</director>\n")
+
+    # Cast (series uses 'cast' key, not 'actors')
+    cast_str = props.get('cast') or ""
+    if cast_str:
+        for actor in [a.strip() for a in cast_str.split(',') if a.strip()]:
+            xml.write(f"  <actor>\n    <name>{_xml_escape(actor)}</name>\n  </actor>\n")
+
+    # Ratings block
+    rating = str(getattr(s, "rating", "") or "")
+    if rating:
+        xml.write(f'  <ratings>\n    <rating name="tmdb" default="true"><value>{_xml_escape(rating)}</value></rating>\n  </ratings>\n')
+
+    # Unique IDs
+    tmdb = _valid_tmdb_id(getattr(s, "tmdb_id", None))
+    if tmdb:
+        xml.write(f'  <uniqueid type="tmdb" default="true">{_xml_escape(tmdb)}</uniqueid>\n')
+    imdb = str(getattr(s, "imdb_id", "") or "")
+    if imdb and imdb.lower() not in ("null", "none"):
+        xml.write(f'  <uniqueid type="imdb">{_xml_escape(imdb)}</uniqueid>\n')
+
+    # Thumb
+    logo_url = _logo_url(s)
+    if logo_url:
+        xml.write(f"  <thumb>{_xml_escape(logo_url)}</thumb>\n")
+
     xml.write("</tvshow>\n")
     return xml.getvalue().encode("utf-8")
 
 
 # -------------------- Filename helpers --------------------
 
+def _episode_title(e: Episode) -> str:
+    """Extract a clean episode title, stripping any leading series-name / SxxExx prefix
+    that M3U providers commonly prepend (e.g. 'Series Name (2022) - S02E03 - Actual Title'
+    becomes 'Actual Title')."""
+    raw = getattr(e, "name", "") or ""
+    stripped = re.sub(r'^.*?S\d+E\d+\s*[-\u2013]\s*', '', raw, flags=re.IGNORECASE).strip()
+    return stripped or raw or "Episode"
+
+
 def _episode_filename(e: Episode) -> str:
     ss = getattr(e, "season_number", 0) or 0
     ee = getattr(e, "episode_number", 0) or 0
-    title = _norm_fs_name(getattr(e, "name", "") or "Episode")
+    title = _norm_fs_name(_episode_title(e))
     return f"S{ss:02d}E{ee:02d} - {title}.strm"
 
 
 def _episode_nfo_filename(e: Episode) -> str:
     ss = getattr(e, "season_number", 0) or 0
     ee = getattr(e, "episode_number", 0) or 0
-    return f"S{ss:02d}E{ee:02d}.nfo"
+    title = _norm_fs_name(_episode_title(e))
+    return f"S{ss:02d}E{ee:02d} - {title}.nfo"
 
 
 def _series_expected_count(series_id: int) -> int:
@@ -734,18 +972,17 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
-    # Use name field - title field doesn't exist in Movie model
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, category_name: str = "Uncategorised") -> None:
     raw_name = movie.name or ""
     movie_name = _clean_name(raw_name, clean_regex)
     movie_year = getattr(movie, "year", None)
+    movie_tmdb = getattr(movie, "tmdb_id", None)
 
-    m_folder = root / "Movies" / _movie_folder_name(movie_name, movie_year)
+    m_folder = root / "Movies" / category_name / _movie_folder_name(movie_name, movie_year, tmdb_id=movie_tmdb)
     
     # Build .strm filename - add provider suffix for multi-provider mode
-    base_filename = _movie_folder_name(movie_name, movie_year)
+    base_filename = _movie_folder_name(movie_name, movie_year, tmdb_id=movie_tmdb)
     if provider_suffix:
-        # Add provider suffix: "Movie (2023) - ProviderName.strm"
         strm_filename = f"{base_filename} - {_norm_fs_name(provider_suffix)}.strm"
     else:
         strm_filename = f"{base_filename}.strm"
@@ -758,7 +995,6 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
     if use_direct_urls and relation:
         url = relation.get_stream_url()
         if not url:
-            # Fallback to proxy if direct URL not available (non-XC account)
             url = f"{base_url.rstrip('/')}/proxy/vod/movie/{movie.uuid}"
             if stream_id:
                 url = f"{url}?stream_id={stream_id}"
@@ -767,7 +1003,6 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         if stream_id:
             url = f"{url}?stream_id={stream_id}"
 
-    # Time the write operation for adaptive throttling
     start_time = time.time()
     wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie", dry_run)
     if wrote and throttle:
@@ -779,7 +1014,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
     if write_nfos and not dry_run:
         nfo_start = time.time()
         nfo_path = m_folder / "movie.nfo"
-        nfo_bytes = _nfo_movie(movie, clean_name=movie_name)
+        nfo_bytes = _nfo_movie(movie, clean_name=movie_name, relation=relation)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
         if wrote_nfo and throttle:
             throttle.record_write(time.time() - nfo_start)
@@ -787,7 +1022,7 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
             report_rows.append(["movie_nfo", "", "", raw_name, movie_year or "", str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None) -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, series_category: str = "Uncategorised") -> None:
     # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
     # Episodes can disappear mid-generation due to sync conflicts
     try:
@@ -808,10 +1043,11 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
     except Exception as validation_error:
         LOGGER.debug("Episode validation check failed: %s. Continuing anyway.", validation_error)
 
-    s_folder = root / "TV" / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None))
+    series_tmdb = getattr(series, "tmdb_id", None)
+    s_folder = root / "TV" / series_category / _series_folder_name(_clean_name(series.name or "", clean_regex), getattr(series, "year", None), tmdb_id=series_tmdb)
     season_number = getattr(episode, "season_number", 0) or 0
     e_folder = s_folder / _season_folder_name(season_number)
-    
+
     # Build .strm filename - add provider suffix for multi-provider mode
     base_strm_name = _episode_filename(episode)
     if provider_suffix:
@@ -900,9 +1136,8 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         # episode nfo
         ep_start = time.time()
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
-        # Pass cleaned episode name for consistency with movie/season NFO generation
         episode_name = _clean_name(getattr(episode, "name", "") or "", clean_regex)
-        ep_nfo_bytes = _nfo_episode(episode, clean_name=episode_name)
+        ep_nfo_bytes = _nfo_episode(episode, clean_name=episode_name, series_name=series.name, relation=relation)
         wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
         if wrote_e and throttle:
             throttle.record_write(time.time() - ep_start)
@@ -987,16 +1222,11 @@ def _cleanup(rows: List[List[str]], root: Path, manifest: Dict[str, Any], apply:
                         nfo_path.unlink()
                         deleted_nfos += 1
                 else:  # episode
-                    # Delete S##E##.nfo for this episode
-                    # .strm filename is like "S01E02 - Title.strm", .nfo is "S01E02.nfo"
-                    strm_stem = p.stem  # "S01E02 - Title"
-                    # Extract S##E## pattern
-                    m = re.match(r'(S\d+E\d+)', strm_stem, re.I)
-                    if m:
-                        episode_nfo = p.parent / f"{m.group(1)}.nfo"
-                        if episode_nfo.exists():
-                            episode_nfo.unlink()
-                            deleted_nfos += 1
+                    # NFO shares the same stem as the .strm file
+                    episode_nfo = p.with_suffix(".nfo")
+                    if episode_nfo.exists():
+                        episode_nfo.unlink()
+                        deleted_nfos += 1
 
                 rows.append(["cleanup", "", "", p.name, "", uid, str(p), "", "deleted", f"stale_{typ}"])
             except Exception as e:
@@ -1140,12 +1370,13 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
         m3u_account__is_active=True,
     ).filter(
         Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
-    ).select_related('m3u_account').order_by('-m3u_account__priority', 'id')
+    ).select_related('m3u_account', 'category').order_by('-m3u_account__priority', 'id')
 
     qs = _eligible_movie_queryset().prefetch_related(
         Prefetch('m3u_relations', queryset=active_movie_relations, to_attr='active_relations')
     ).only(
-        "id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo"
+        "id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo",
+        "duration_secs", "custom_properties"
     )
     all_movies = list(qs)
     LOGGER.info("Movies found in database: %d", len(all_movies))
@@ -1175,22 +1406,24 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
                         rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "skipped", "no_active_relations"])
                     return
                 
+                # Category from highest-priority relation (used for all provider variants)
+                cat_name = _norm_fs_name(relations[0].category.name) if relations[0].category else "Uncategorised"
+
                 # If single provider mode, only use the first (highest priority) relation
                 if not multi_provider_mode:
                     relations = [relations[0]]
-                
+
                 # Generate STRM file for each provider relation
                 # First provider gets no suffix, others get provider name suffix
                 for idx, relation in enumerate(relations):
                     provider_name = relation.m3u_account.name if relation.m3u_account else None
                     provider_suffix = None if idx == 0 else provider_name
-                    
-                    # Only write NFO once (for first provider)
                     write_nfo_for_this = write_nfos and idx == 0
-                    
+
                     _make_movie_strm_and_nfo(
-                        m, base_url, root, write_nfo_for_this, rows, lock, manifest, 
-                        relation, dry_run, throttle, clean_regex, use_direct_urls, provider_suffix
+                        m, base_url, root, write_nfo_for_this, rows, lock, manifest,
+                        relation, dry_run, throttle, clean_regex, use_direct_urls, provider_suffix,
+                        category_name=cat_name
                     )
             except Exception as e:
                 LOGGER.warning("Movie id=%s failed: %s", m.id, e)
@@ -1386,10 +1619,19 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
                 dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
     # Only generate .strm files for series with active provider relations
-    # Annotate with episode count to avoid N+1 queries (distinct=True prevents inflated counts from join)
+    # Prefetch series relations to get category for directory structure
+    active_series_relations = M3USeriesRelation.objects.filter(
+        m3u_account__is_active=True,
+    ).filter(
+        Q(category__isnull=True) | _enabled_category_subquery("m3u_account_id", "category_id")
+    ).select_related('m3u_account', 'category').order_by('-m3u_account__priority', 'id')
+
     series_qs = _eligible_series_queryset().annotate(
         episode_count=Count('episodes', distinct=True)
-    ).only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo")
+    ).prefetch_related(
+        Prefetch('m3u_relations', queryset=active_series_relations, to_attr='active_relations')
+    ).only("id", "uuid", "name", "year", "description", "rating", "genre", "tmdb_id", "imdb_id", "logo",
+           "custom_properties")
     total = series_qs.count()
     LOGGER.info("Series to process: %d", total)
 
@@ -1405,7 +1647,10 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
     for s in series_qs.iterator(chunk_size=200):
         try:
-            series_folder = root / "TV" / _series_folder_name(_clean_name(s.name or "", clean_regex), getattr(s, "year", None))
+            # Category from highest-priority series relation
+            s_relations = getattr(s, 'active_relations', [])
+            s_cat_name = _norm_fs_name(s_relations[0].category.name) if s_relations and s_relations[0].category else "Uncategorised"
+            series_folder = root / "TV" / s_cat_name / _series_folder_name(_clean_name(s.name or "", clean_regex), getattr(s, "year", None), tmdb_id=getattr(s, "tmdb_id", None))
             # Use annotated episode_count to avoid N+1 query
             expected = getattr(s, 'episode_count', 0)
 
@@ -1447,7 +1692,8 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 Prefetch('m3u_relations', queryset=active_episode_relations, to_attr='active_relations')
             ).only(
                 "id", "uuid", "name", "season_number", "episode_number",
-                "air_date", "description", "rating", "tmdb_id", "imdb_id"
+                "air_date", "description", "rating", "tmdb_id", "imdb_id",
+                "duration_secs", "custom_properties"
             ).order_by("season_number", "episode_number"))
             total_after_distinct = len(eps)
 
@@ -1501,7 +1747,8 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                             
                             _make_episode_strm_and_nfo(
                                 s, e, base_url, root, write_nfo_for_this, rows, lock, manifest,
-                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix
+                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix,
+                                series_category=s_cat_name
                             )
                     except Exception as ep_error:
                         LOGGER.warning("Episode id=%s failed: %s", e.id, ep_error)
@@ -1702,7 +1949,7 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.13"
+    version = "0.0.13-fork.1"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
