@@ -1,6 +1,6 @@
 """
 vod2strm – Dispatcharr Plugin
-Version: 0.0.13-fork.1
+Version: 0.0.13-fork.2
 
 Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
@@ -1353,6 +1353,10 @@ def _run_job_sync(
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
 
+        # Notify Jellyfin of changed paths (skip dry run and stats-only)
+        if mode != "stats" and not dry_run:
+            _maybe_notify_jellyfin(rows)
+
     except Exception as e:  # pragma: no cover
         LOGGER.exception("Job failed: %s", e)
         rows.append(["error", "", "", "", "", "", "", "", "error", str(e)])
@@ -1945,11 +1949,91 @@ def _stats_only(rows: List[List[str]], base_url: str, root: Path, write_nfos: bo
     rows.append(["stats", "", "", "fs_nfos", "", "", "", "", "info", str(nfos)])
 
 
+# -------------------- Jellyfin Notification --------------------
+
+def _notify_jellyfin(url: str, api_key: str, changed_paths: List[str]) -> Tuple[bool, str]:
+    """
+    Notify Jellyfin to rescan specific paths via POST /Library/Media/Updated.
+    Returns (success, message) — never raises.
+    """
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    endpoint = f"{url.rstrip('/')}/Library/Media/Updated"
+    updates = [{"Path": p, "UpdateType": "scan"} for p in changed_paths]
+    body = _json.dumps({"Updates": updates}).encode("utf-8")
+
+    req = urllib.request.Request(endpoint, data=body, method="POST")
+    req.add_header("Authorization", f'MediaBrowser Token="{api_key}"')
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return (True, f"Jellyfin notified for {len(changed_paths)} path(s) (HTTP {resp.getcode()})")
+    except urllib.error.HTTPError as e:
+        return (False, f"Jellyfin HTTP {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        return (False, f"Jellyfin unreachable: {e.reason}")
+    except Exception as e:
+        return (False, f"Jellyfin notification failed: {e}")
+
+
+def _maybe_notify_jellyfin(rows: List[List[str]]) -> None:
+    """
+    Load Jellyfin settings from PluginConfig and trigger a targeted library
+    rescan if enabled and .strm files were actually written.
+    Appends result to rows for inclusion in the CSV report.
+    """
+    try:
+        from apps.plugins.models import PluginConfig
+        config = PluginConfig.objects.filter(key="vod2strm").first()
+        settings = config.settings if config else {}
+    except Exception:
+        settings = {}
+
+    if not settings.get("jellyfin_notify", False):
+        return
+
+    jf_url = (settings.get("jellyfin_url") or "").strip()
+    jf_key = (settings.get("jellyfin_api_key") or "").strip()
+    plugin_root = (settings.get("output_root") or DEFAULT_ROOT).rstrip("/")
+    jf_root = (settings.get("jellyfin_library_root") or "").strip().rstrip("/")
+
+    if not jf_url or not jf_key:
+        LOGGER.warning("Jellyfin notify enabled but URL or API key missing; skipping.")
+        rows.append(["jellyfin", "", "", "", "", "", "", "", "skipped", "missing_url_or_key"])
+        return
+
+    # Collect unique parent dirs of written .strm files
+    changed_dirs: set[str] = set()
+    for row in rows:
+        if row[8] == "written" and row[0] in ("movie", "episode") and row[6]:
+            parent = str(Path(row[6]).parent)
+            # Remap path from plugin output_root to Jellyfin mount path
+            if jf_root:
+                parent = parent.replace(plugin_root, jf_root, 1)
+            changed_dirs.add(parent)
+
+    if not changed_dirs:
+        return  # Nothing written, nothing to notify
+
+    LOGGER.info("Notifying Jellyfin at %s for %d changed path(s)", jf_url, len(changed_dirs))
+    success, message = _notify_jellyfin(jf_url, jf_key, sorted(changed_dirs))
+
+    if success:
+        LOGGER.info("Jellyfin: %s", message)
+        rows.append(["jellyfin", "", "", "", "", "", "", "", "notified", message])
+    else:
+        LOGGER.warning("Jellyfin: %s", message)
+        rows.append(["jellyfin", "", "", "", "", "", "", "", "failed", message])
+
+
 # -------------------- Plugin Class --------------------
 
 class Plugin:
     name = "vod2strm"
-    version = "0.0.13-fork.1"
+    version = "0.0.13-fork.2"
     description = "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports."
 
     fields = [
@@ -2054,6 +2138,34 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help": "Generate STRM files for all providers. When disabled, only generates for the highest priority provider.",
+        },
+        {
+            "id": "jellyfin_notify",
+            "label": "Notify Jellyfin After Generation",
+            "type": "boolean",
+            "default": False,
+            "help": "Trigger a targeted Jellyfin library rescan after .strm files are created or updated. Only fires when files are actually written (not on dry runs or cached skips).",
+        },
+        {
+            "id": "jellyfin_url",
+            "label": "Jellyfin URL",
+            "type": "string",
+            "default": "",
+            "help": "Jellyfin server base URL (e.g. http://jellyfin:8096). Note: Dispatcharr runs behind gluetun VPN — Docker container names may not resolve. Use the container IP if needed (find it with: docker inspect jellyfin).",
+        },
+        {
+            "id": "jellyfin_api_key",
+            "label": "Jellyfin API Key",
+            "type": "string",
+            "default": "",
+            "help": "API key for Jellyfin authentication. Generate one in Jellyfin Dashboard > API Keys.",
+        },
+        {
+            "id": "jellyfin_library_root",
+            "label": "Jellyfin Library Root",
+            "type": "string",
+            "default": "",
+            "help": "Path as Jellyfin sees the STRM output (e.g. /media/strm). Remaps Output Root to this path when notifying Jellyfin. Leave blank if both containers mount the same path.",
         },
     ]
 
