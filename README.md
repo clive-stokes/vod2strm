@@ -24,7 +24,8 @@ vod2strm transforms Dispatcharr's VOD database into media server-compatible `.st
 - **Compare-Before-Write**: Only writes when content changes (hash-based comparison for NFO files)
 
 ### Automation
-- **Auto-run After VOD Refresh**: Optionally trigger generation automatically when Dispatcharr refreshes VOD content (30-second debounce)
+- **Auto-run After VOD Refresh**: Optionally trigger generation automatically when Dispatcharr refreshes VOD content (30-second debounce). Signals register at module load with a background retry, so auto-run works from Dispatcharr startup without any manual interaction
+- **Jellyfin Rescan Notification**: Optionally trigger a targeted Jellyfin library rescan of only the changed folders after generation
 
 ### Debugging & Reports
 - **Dry Run Mode**: Simulate generation without touching filesystem (testing)
@@ -78,6 +79,11 @@ Movies and series are organised first by provider category (e.g. `EN - Action`),
 | **Name Cleaning Regex** | Text | (empty) | Optional regex to strip patterns from names (e.g., `^(?:EN\|TOP)\s*-\s*`) |
 | **Content Filter: Movie IDs** | Text | (empty) | Comma-separated database IDs to include (e.g., `123,456`). Empty = generate all |
 | **Content Filter: Series IDs** | Text | (empty) | Comma-separated database IDs to include (e.g., `789,012`). Empty = generate all |
+| **Multi-Provider Mode** | Boolean | ☐ | Generate a `.strm` per provider instead of highest-priority only |
+| **Notify Jellyfin After Generation** | Boolean | ☐ | Trigger a targeted Jellyfin library rescan of changed folders |
+| **Jellyfin URL** | Text | (empty) | Jellyfin server URL (e.g., `http://jellyfin:8096`) |
+| **Jellyfin API Key** | Text | (empty) | API key used for the rescan call |
+| **Jellyfin Library Root** | Text | (empty) | Path to the STRM output as Jellyfin sees it (path remapping) |
 
 ## Content Filtering
 
@@ -122,7 +128,8 @@ mkdir -p /opt/dispatcharr/plugins/vod2strm
 ```
 vod2strm/
 ├── __init__.py
-└── plugin.py
+├── plugin.py
+└── plugin.json
 ```
 
 ### 3. Restart Dispatcharr
@@ -190,7 +197,7 @@ Adaptive throttle: NAS slow (avg 0.350s), reducing workers 4 → 3
 Semantic versioning: `MAJOR.MINOR.PATCH`
 
 - Upstream: `0.0.13` ([cmc0619/vod2strm](https://github.com/cmc0619/vod2strm))
-- This fork: `0.0.13-fork.1`
+- This fork: `0.0.13-fork.3`
 
 ---
 
@@ -236,6 +243,18 @@ Dispatcharr stores ffprobe output in `detailed_info` using ffprobe key names (`c
 ### Logo URL fix
 
 `_logo_url()` helper extracts `VODLogo.url` correctly. Upstream called `str(logo)` which hit `VODLogo.__str__` and returned the logo name instead of its URL.
+
+### Jellyfin rescan notification (fork.2)
+
+After generation, optionally POST the changed folders to Jellyfin's `/Library/Media/Updated` endpoint so only those paths get rescanned, instead of waiting for a full scheduled library scan. **Jellyfin Library Root** remaps paths when Jellyfin mounts the STRM output at a different location than this plugin writes to.
+
+### Auto-run signal registration at module load (fork.3)
+
+Port of upstream [PR #50](https://github.com/cmc0619/vod2strm/pull/50) (released upstream as `0.0.13b`). Fixes the flaw in the lazy registration from upstream PR #47, where auto-run signals only registered after the first manual plugin button click — leaving auto-run silently dead after every Dispatcharr restart. Signals now register when the module loads, with a background retry thread (every 3s, up to 10 attempts) to handle Dispatcharr's two-phase plugin loading where the database isn't ready on first import. The relation signal handlers also now fire on updates as well as creates, since a VOD refresh often updates existing `M3U*Relation` rows rather than creating new ones.
+
+### plugin.json manifest (fork.3)
+
+Adds the `plugin.json` manifest newer Dispatcharr versions expect, so the plugin no longer shows the "ask the developer to add plugin.json" legacy warning. Metadata only — fields and actions remain defined in `plugin.py`.
 
 ## License
 
