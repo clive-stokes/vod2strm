@@ -1,6 +1,6 @@
 {
   "name": "vod2strm",
-  "version": "0.0.13-fork.2",
+  "version": "0.0.13-fork.3",
   "description": "Generate .strm and NFO files for Movies & Series from the Dispatcharr DB, with cleanup and CSV reports.",
   "author": "clive-stokes (fork of mjulian87/vod2strm)",
   "help_url": "https://github.com/clive-stokes/vod2strm#readme"
