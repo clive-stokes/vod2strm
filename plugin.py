@@ -27,6 +27,7 @@ from __future__ import annotations
 
 # Ensure plugin directory is in sys.path so Celery workers can import this module
 import sys
+import subprocess
 from pathlib import Path
 _plugin_parent = Path(__file__).parent.parent
 if str(_plugin_parent) not in sys.path:
@@ -2266,7 +2267,7 @@ class Plugin:
             "multi_provider_mode": multi_provider_mode,
         }
 
-        # Run generation in a background daemon thread.
+        # Run generation in a DETACHED SUBPROCESS.
         #
         # Dispatcharr 0.26 dropped support for plugin-defined Celery tasks: the
         # worker no longer imports a plugin's @shared_task, so enqueuing
@@ -2274,30 +2275,36 @@ class Plugin:
         # nothing ever runs. Per Dispatcharr's Plugins.md a plugin must keep
         # run() non-blocking and must not define its own tasks; the supported
         # background path is .delay() on an EXISTING backend task, but there is
-        # no built-in task for .strm generation. So we run it ourselves in a
-        # thread. (This restores — and is the correct home for — the threading
-        # path a previous refactor removed on the assumption Celery was always
-        # usable for custom tasks.)
-        def _bg_run():
-            try:
-                _run_job_sync(**args)
-            except Exception as e:
-                LOGGER.error("Background run_job failed: %s", e, exc_info=True)
-            finally:
-                # Each thread holds its own Django DB connections; close them so
-                # they don't leak (previously handled by the Celery task_postrun
-                # signal, which no longer fires on this path).
-                try:
-                    from django.db import connections
-                    connections.close_all()
-                except Exception:
-                    pass
-
-        threading.Thread(target=_bg_run, name="vod2strm-run", daemon=True).start()
-        LOGGER.info(
-            "Started background STRM generation (mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)",
-            mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls,
+        # no built-in task for .strm generation.
+        #
+        # An in-process background thread is not enough: it lives inside the web
+        # worker, and gunicorn recycles workers (max_requests/timeout), which
+        # kills a long run mid-flight. So we launch a separate, fully detached
+        # `manage.py shell` process (start_new_session=True) that runs the job
+        # independently of the request and the worker lifecycle. Args are passed
+        # as a JSON env var. It logs to the plugin's own file logger.
+        runner = (
+            "import os, json, sys; "
+            "sys.path.insert(0, '/data/plugins'); "
+            "from vod2strm.plugin import _run_job_sync; "
+            "_run_job_sync(**json.loads(os.environ['VOD2STRM_JOB_ARGS']))"
         )
+        try:
+            subprocess.Popen(
+                [sys.executable, "manage.py", "shell", "-c", runner],
+                cwd="/app",
+                env=dict(os.environ, VOD2STRM_JOB_ARGS=json.dumps(args)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            LOGGER.info(
+                "Launched detached STRM generation (mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)",
+                mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls,
+            )
+        except Exception as e:
+            LOGGER.error("Failed to launch detached generation subprocess: %s", e, exc_info=True)
 
 
 # -------------------- Celery task registration --------------------

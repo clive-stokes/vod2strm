@@ -235,7 +235,7 @@ curl -X POST \
 
 <!-- anchor: recent-features -->
 
-### Dispatcharr 0.26 broke plugin Celery tasks — background-thread fix
+### Dispatcharr 0.26 broke plugin Celery tasks — detached-subprocess fix
 **Location:** `plugin.py` `_enqueue()`
 
 **Problem:** Dispatcharr 0.26 no longer imports a plugin's `@shared_task` into the
@@ -246,16 +246,21 @@ define custom Celery tasks and must keep `run(action, params, context)` non-bloc
 — the supported background path is `.delay()` on an **existing** backend task, of
 which there is none for `.strm` generation.
 
-**Fix:** `_enqueue()` now runs `_run_job_sync()` in a **background daemon thread**
-(closing Django DB connections in a `finally`) instead of enqueuing a Celery task.
-This restores the threading path a prior refactor removed ("Celery is required").
-Validated on 0.26 — a generate action runs to `RUN END` with no Celery involved.
+**Fix:** `_enqueue()` launches a **detached subprocess** — a separate
+`manage.py shell` process (`subprocess.Popen(..., start_new_session=True)`, args
+passed as a JSON env var `VOD2STRM_JOB_ARGS`) that runs `_run_job_sync()`
+independently of the request and the web-worker lifecycle. An in-worker background
+**thread** was tried first but is too fragile for long runs: it lives inside the
+gunicorn web worker, and worker recycling (max_requests/timeout) kills the job
+mid-flight — observed, a full-library series run died after ~6 series when its worker
+recycled. The detached process survives. Validated on 0.26 — generation runs to
+`RUN END` with no Celery involved.
 
 **Still open:** scheduled generation (Celery Beat `celery_generate_all`) still uses
 the dead `@shared_task` path; it won't fire on 0.26. Convert scheduling to a
-Dispatcharr `PeriodicTask`/external cron that triggers the threaded action if
-scheduled runs are needed. The `@shared_task` defs are left in place (harmless;
-unused on the action path).
+Dispatcharr `PeriodicTask`/external cron that triggers the action (which now spawns
+the detached subprocess) if scheduled runs are needed. The `@shared_task` defs are
+left in place (harmless; unused on the action path).
 
 ### Database Cleanup Buttons (Issue #556)
 **Location:** `plugin.py:976-1017`
