@@ -27,6 +27,7 @@ from __future__ import annotations
 
 # Ensure plugin directory is in sys.path so Celery workers can import this module
 import sys
+import subprocess
 from pathlib import Path
 _plugin_parent = Path(__file__).parent.parent
 if str(_plugin_parent) not in sys.path:
@@ -2266,33 +2267,44 @@ class Plugin:
             "multi_provider_mode": multi_provider_mode,
         }
 
-        # REASONING: Threading fallback removed
-        # This plugin runs inside Dispatcharr, which requires Celery to function.
-        # If Celery is unavailable, Dispatcharr itself won't be running, so there's
-        # no scenario where this plugin is active but Celery is down.
-        # Removing the threading fallback simplifies the code and removes unnecessary
-        # complexity for a scenario that cannot occur in production.
-
-        if not celery_app:
-            LOGGER.error("Celery not available - cannot enqueue background task. This should not happen if Dispatcharr is running correctly.")
-            return
-
-        # Try to call the task - use send_task as fallback if direct call fails
-        task_name = "vod2strm.plugin.run_job"
+        # Run generation in a DETACHED SUBPROCESS.
+        #
+        # Dispatcharr 0.26 dropped support for plugin-defined Celery tasks: the
+        # worker no longer imports a plugin's @shared_task, so enqueuing
+        # "vod2strm.plugin.run_job" raises `KeyError: unregistered task` and
+        # nothing ever runs. Per Dispatcharr's Plugins.md a plugin must keep
+        # run() non-blocking and must not define its own tasks; the supported
+        # background path is .delay() on an EXISTING backend task, but there is
+        # no built-in task for .strm generation.
+        #
+        # An in-process background thread is not enough: it lives inside the web
+        # worker, and gunicorn recycles workers (max_requests/timeout), which
+        # kills a long run mid-flight. So we launch a separate, fully detached
+        # `manage.py shell` process (start_new_session=True) that runs the job
+        # independently of the request and the worker lifecycle. Args are passed
+        # as a JSON env var. It logs to the plugin's own file logger.
+        runner = (
+            "import os, json, sys; "
+            "sys.path.insert(0, '/data/plugins'); "
+            "from vod2strm.plugin import _run_job_sync; "
+            "_run_job_sync(**json.loads(os.environ['VOD2STRM_JOB_ARGS']))"
+        )
         try:
-            if celery_run_job is not None:
-                # Direct call if function is available
-                celery_run_job.delay(args)
-                LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
-            else:
-                # Fallback: send by name (works even if module not imported by worker yet)
-                celery_app.send_task(task_name, args=[args])
-                LOGGER.info("Enqueued Celery task %s by name (mode=%s, dry_run=%s)", task_name, mode, dry_run)
+            subprocess.Popen(
+                [sys.executable, "manage.py", "shell", "-c", runner],
+                cwd="/app",
+                env=dict(os.environ, VOD2STRM_JOB_ARGS=json.dumps(args)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            LOGGER.info(
+                "Launched detached STRM generation (mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)",
+                mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls,
+            )
         except Exception as e:
-            LOGGER.warning("Failed to enqueue task directly, trying send_task by name: %s", e)
-            # Fallback: send by name
-            celery_app.send_task(task_name, args=[args])
-            LOGGER.info("Enqueued Celery task %s by name (fallback, mode=%s)", task_name, mode)
+            LOGGER.error("Failed to launch detached generation subprocess: %s", e, exc_info=True)
 
 
 # -------------------- Celery task registration --------------------
