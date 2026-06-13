@@ -235,6 +235,28 @@ curl -X POST \
 
 <!-- anchor: recent-features -->
 
+### Dispatcharr 0.26 broke plugin Celery tasks — background-thread fix
+**Location:** `plugin.py` `_enqueue()`
+
+**Problem:** Dispatcharr 0.26 no longer imports a plugin's `@shared_task` into the
+Celery worker, so enqueuing `vod2strm.plugin.run_job` raises
+`KeyError: unregistered task` and UI / scheduled / auto-run generation silently does
+nothing (worked under 0.24). Dispatcharr's `Plugins.md` states plugins must **not**
+define custom Celery tasks and must keep `run(action, params, context)` non-blocking
+— the supported background path is `.delay()` on an **existing** backend task, of
+which there is none for `.strm` generation.
+
+**Fix:** `_enqueue()` now runs `_run_job_sync()` in a **background daemon thread**
+(closing Django DB connections in a `finally`) instead of enqueuing a Celery task.
+This restores the threading path a prior refactor removed ("Celery is required").
+Validated on 0.26 — a generate action runs to `RUN END` with no Celery involved.
+
+**Still open:** scheduled generation (Celery Beat `celery_generate_all`) still uses
+the dead `@shared_task` path; it won't fire on 0.26. Convert scheduling to a
+Dispatcharr `PeriodicTask`/external cron that triggers the threaded action if
+scheduled runs are needed. The `@shared_task` defs are left in place (harmless;
+unused on the action path).
+
 ### Database Cleanup Buttons (Issue #556)
 **Location:** `plugin.py:976-1017`
 

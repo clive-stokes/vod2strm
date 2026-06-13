@@ -2266,33 +2266,38 @@ class Plugin:
             "multi_provider_mode": multi_provider_mode,
         }
 
-        # REASONING: Threading fallback removed
-        # This plugin runs inside Dispatcharr, which requires Celery to function.
-        # If Celery is unavailable, Dispatcharr itself won't be running, so there's
-        # no scenario where this plugin is active but Celery is down.
-        # Removing the threading fallback simplifies the code and removes unnecessary
-        # complexity for a scenario that cannot occur in production.
+        # Run generation in a background daemon thread.
+        #
+        # Dispatcharr 0.26 dropped support for plugin-defined Celery tasks: the
+        # worker no longer imports a plugin's @shared_task, so enqueuing
+        # "vod2strm.plugin.run_job" raises `KeyError: unregistered task` and
+        # nothing ever runs. Per Dispatcharr's Plugins.md a plugin must keep
+        # run() non-blocking and must not define its own tasks; the supported
+        # background path is .delay() on an EXISTING backend task, but there is
+        # no built-in task for .strm generation. So we run it ourselves in a
+        # thread. (This restores — and is the correct home for — the threading
+        # path a previous refactor removed on the assumption Celery was always
+        # usable for custom tasks.)
+        def _bg_run():
+            try:
+                _run_job_sync(**args)
+            except Exception as e:
+                LOGGER.error("Background run_job failed: %s", e, exc_info=True)
+            finally:
+                # Each thread holds its own Django DB connections; close them so
+                # they don't leak (previously handled by the Celery task_postrun
+                # signal, which no longer fires on this path).
+                try:
+                    from django.db import connections
+                    connections.close_all()
+                except Exception:
+                    pass
 
-        if not celery_app:
-            LOGGER.error("Celery not available - cannot enqueue background task. This should not happen if Dispatcharr is running correctly.")
-            return
-
-        # Try to call the task - use send_task as fallback if direct call fails
-        task_name = "vod2strm.plugin.run_job"
-        try:
-            if celery_run_job is not None:
-                # Direct call if function is available
-                celery_run_job.delay(args)
-                LOGGER.info("Enqueued Celery task run_job(mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)", mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls)
-            else:
-                # Fallback: send by name (works even if module not imported by worker yet)
-                celery_app.send_task(task_name, args=[args])
-                LOGGER.info("Enqueued Celery task %s by name (mode=%s, dry_run=%s)", task_name, mode, dry_run)
-        except Exception as e:
-            LOGGER.warning("Failed to enqueue task directly, trying send_task by name: %s", e)
-            # Fallback: send by name
-            celery_app.send_task(task_name, args=[args])
-            LOGGER.info("Enqueued Celery task %s by name (fallback, mode=%s)", task_name, mode)
+        threading.Thread(target=_bg_run, name="vod2strm-run", daemon=True).start()
+        LOGGER.info(
+            "Started background STRM generation (mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)",
+            mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls,
+        )
 
 
 # -------------------- Celery task registration --------------------
