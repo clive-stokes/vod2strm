@@ -1366,6 +1366,46 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
+def _gevent_active() -> bool:
+    """
+    True when DB access is gevent-bound (Dispatcharr's runtime).
+
+    Dispatcharr's DB backend is django_db_geventpool (a gevent connection pool
+    over psycopg3). Pooled connections are greenlet-affine, so a
+    ThreadPoolExecutor worker thread that borrows one to do a query raises
+    "This operation would block forever" — the connection's socket waits on a
+    gevent hub that does not exist in the worker thread. That silently fails
+    the per-item job: the .strm is written but its movie.nfo is skipped,
+    leaving Jellyfin with no <uniqueid> to match on. When this runtime is
+    detected we must run jobs sequentially in the calling greenlet (cooperative
+    blocking DB access is fine there).
+
+    Note: NOT detectable via gevent.monkey.is_module_patched() — Dispatcharr
+    does not run monkey.patch_all(); only the DB layer is gevent-cooperative.
+    """
+    try:
+        from django.db import connection
+        if "geventpool" in (connection.settings_dict.get("ENGINE") or ""):
+            return True
+    except Exception:
+        pass
+    return "gevent" in sys.modules
+
+
+def _map_jobs(job, batch, workers: int) -> None:
+    """
+    Run `job` over `batch`. Sequential under gevent (threaded DB access blocks)
+    or when only one worker is requested; otherwise parallel via a thread pool
+    for I/O concurrency on non-gevent runtimes.
+    """
+    if workers <= 1 or _gevent_active():
+        for item in batch:
+            job(item)
+        return
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(job, batch))
+
+
 def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
     LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
                 dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
@@ -1435,8 +1475,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 with lock:
                     rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
 
-        with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
-            list(ex.map(job, batch))
+        _map_jobs(job, batch, max(1, current_workers))
 
         # Log progress every batch
         LOGGER.info("Movies: processed %d / %d (current workers: %d)", min(i + batch_size, len(all_movies)), len(all_movies), current_workers)
@@ -1760,8 +1799,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                         with lock:
                             rows.append(["episode", s.name or "", getattr(e, "season_number", 0) or 0, getattr(e, "name", "") or "", getattr(s, "year", ""), str(e.uuid), "", "", "error", str(ep_error)])
 
-                with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
-                    list(ex.map(job, batch))
+                _map_jobs(job, batch, max(1, current_workers))
 
         except Exception as e:
             LOGGER.warning("Series id=%s failed: %s", getattr(s, "id", "?"), e)
