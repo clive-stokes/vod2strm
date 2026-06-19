@@ -6,10 +6,10 @@ Spec:
 - ORM (in-process) with Celery background tasks (non-blocking UI).
 - Buttons: Stats, Generate Movies, Generate Series, Generate All.
 - STRM generation:
-  * Movies -> <root>/Movies/{Category}/{Name} ({Year}) {tmdb-ID}/{Name} ({Year}) {tmdb-ID}.strm
-  * Series -> <root>/TV/{Category}/{SeriesName (Year)} {tmdb-ID}/Season {SS}/S{SS}E{EE} - {Title}.strm
+  * Movies -> <root>/Movies/{Category}/{Name} ({Year}) [tmdbid-ID]/{Name} ({Year}) [tmdbid-ID].strm
+  * Series -> <root>/TV/{Category}/{SeriesName (Year)} [tmdbid-ID]/Season {SS}/S{SS}E{EE} - {Title}.strm
   * Season 00 labeled "Season 00 (Specials)".
-  * {tmdb-ID} suffix omitted when no valid TMDB ID available.
+  * [tmdbid-ID] suffix omitted when no valid TMDB ID available.
   * .strm contents use {base_url}/proxy/vod/(movie|episode)/{uuid}?stream_id={stream_id}
 - NFO generation (compare-before-write, full Jellyfin/Kodi metadata):
   * Movies: movie.nfo — title, plot, outline, year, runtime, genres, director, cast,
@@ -492,14 +492,14 @@ def _series_folder_name(name: str, year: int | None, tmdb_id=None) -> str:
     else:
         base = _norm_fs_name(name or "Unknown Series")
     tmdb = _valid_tmdb_id(tmdb_id)
-    return f"{base} {{tmdb-{tmdb}}}" if tmdb else base
+    return f"{base} [tmdbid-{tmdb}]" if tmdb else base
 
 
 def _movie_folder_name(name: str, year: int | None, tmdb_id=None) -> str:
     """
     Generate folder name for movie.
     Strips any existing (YYYY) pattern from name to avoid duplication when adding year.
-    Appends {tmdb-XXXXX} when a valid TMDB ID is provided.
+    Appends [tmdbid-XXXXX] when a valid TMDB ID is provided.
     """
     if not name:
         name = "Unknown Movie"
@@ -509,7 +509,7 @@ def _movie_folder_name(name: str, year: int | None, tmdb_id=None) -> str:
 
     base = _norm_fs_name(f"{name} ({year})") if year else _norm_fs_name(name)
     tmdb = _valid_tmdb_id(tmdb_id)
-    return f"{base} {{tmdb-{tmdb}}}" if tmdb else base
+    return f"{base} [tmdbid-{tmdb}]" if tmdb else base
 
 
 def _hash_bytes(b: bytes) -> str:
