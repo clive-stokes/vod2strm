@@ -2174,19 +2174,43 @@ class Plugin:
             "from vod2strm.plugin import _run_job_sync; "
             "_run_job_sync(**json.loads(os.environ['VOD2STRM_JOB_ARGS']))"
         )
+        # Capture the child's stdout/stderr to a file rather than DEVNULL: a
+        # failing child (bad interpreter, import error, etc.) would otherwise
+        # die invisibly and the queued job silently never runs. The file logger
+        # inside _run_job_sync handles the normal run log; this catches
+        # everything *before* that point.
+        try:
+            _ensure_dirs()
+            child_log = open(Path(LOG_ROOT) / "detached.log", "ab", buffering=0)
+        except Exception:
+            child_log = subprocess.DEVNULL
+        # Resolve the interpreter robustly. Dispatcharr serves the Django HTTP
+        # API under uWSGI (embedded Python), where `sys.executable` is the
+        # *uwsgi binary*, not python. Execing that with `manage.py shell ...`
+        # makes uWSGI try to parse manage.py as its own config and die with
+        # "unable to load configuration from manage.py" before the job runs —
+        # the queued generation then silently never happens. `sys.prefix`
+        # always resolves to the venv root, so derive the real interpreter from
+        # it and fall back to sys.executable only if absent.
+        py = sys.executable
+        if not (py and os.path.basename(py).startswith("python") and os.path.exists(py)):
+            cand = os.path.join(sys.prefix, "bin", "python")
+            py = cand if os.path.exists(cand) else py
         try:
             subprocess.Popen(
-                [sys.executable, "manage.py", "shell", "-c", runner],
+                [py, "manage.py", "shell", "-c", runner],
                 cwd="/app",
                 env=dict(os.environ, VOD2STRM_JOB_ARGS=json.dumps(args)),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=child_log,
+                stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
             )
             LOGGER.info(
-                "Launched detached STRM generation (mode=%s, dry_run=%s, regex=%s, direct_urls=%s)",
+                "Launched detached STRM generation (mode=%s, dry_run=%s, regex=%s, direct_urls=%s) "
+                "[interp=%s sys.executable=%s sys.argv0=%s]",
                 mode, dry_run, clean_regex, use_direct_urls,
+                py, sys.executable, (sys.argv[0] if sys.argv else None),
             )
         except Exception as e:
             LOGGER.error("Failed to launch detached generation subprocess: %s", e, exc_info=True)
