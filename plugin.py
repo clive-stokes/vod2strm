@@ -40,7 +40,6 @@ import io
 import json
 import logging
 import logging.handlers
-import math
 import os
 try:
     import regex as re  # Use regex library for better Unicode support (aligns with Dispatcharr)
@@ -48,7 +47,6 @@ except ImportError:
     import re  # Fallback to standard library if regex not available
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Tuple, Dict, Any, Optional
@@ -360,89 +358,6 @@ def _save_manifest(root: Path, manifest: Dict[str, Any]) -> None:
 
     except Exception as e:
         LOGGER.warning("Failed to save manifest to %s: %s", manifest_path, e)
-
-
-# -------------------- Adaptive Throttle --------------------
-
-class AdaptiveThrottle:
-    """
-    Monitors write performance and adjusts concurrency dynamically.
-
-    Strategy:
-    - Start conservative with 1 worker, scale up based on performance
-    - Track average write latency over rolling window (20 writes)
-    - If writes are slow (>100ms), cut workers in half
-    - If writes are fast (<30ms), increase workers by 50%
-    - Check every 10 writes for faster response
-    - Bounds: min=1, max=user_setting (capped at 4)
-    """
-
-    def __init__(self, max_workers: int, enabled: bool = True):
-        # Hard cap at 4 to prevent DB connection exhaustion (Django creates 1 conn per thread)
-        # Even though workers do file I/O, accessing model attributes triggers DB connections
-        self.max_workers = min(max_workers, 4)
-        self.enabled = enabled
-        # Start conservative - begin with 1 worker and scale up based on performance
-        self.current_workers = 1 if enabled else self.max_workers
-        self.write_times = []  # Rolling window of last N write times
-        self.window_size = 20  # Track last 20 writes (smaller window for faster response)
-        self.lock = threading.Lock()
-
-        # Thresholds (in seconds) - more aggressive to protect NAS
-        self.slow_threshold = 0.100  # 100ms (down from 200ms)
-        self.fast_threshold = 0.030  # 30ms (down from 50ms)
-
-        # Adjustment rates
-        self.scale_down_factor = 0.5   # Cut in half when slow (more aggressive)
-        self.scale_up_factor = 1.5     # Increase by 50% when fast (scale up faster)
-
-        # Check interval - adjust every N writes (smaller for faster response)
-        self.check_interval = 10
-        self.writes_since_check = 0
-
-    def record_write(self, write_time: float) -> None:
-        """Record a write operation's duration."""
-        if not self.enabled:
-            return
-
-        with self.lock:
-            self.write_times.append(write_time)
-            if len(self.write_times) > self.window_size:
-                self.write_times.pop(0)
-
-            self.writes_since_check += 1
-            if self.writes_since_check >= self.check_interval:
-                self._adjust_concurrency()
-                self.writes_since_check = 0
-
-    def _adjust_concurrency(self) -> None:
-        """Adjust concurrency based on average write time."""
-        if not self.write_times:
-            return
-
-        avg_write_time = sum(self.write_times) / len(self.write_times)
-        old_workers = self.current_workers
-
-        if avg_write_time > self.slow_threshold:
-            # NAS is slow, reduce workers
-            self.current_workers = max(1, int(self.current_workers * self.scale_down_factor))
-            LOGGER.info(
-                "Adaptive throttle: NAS slow (avg %.3fs), reducing workers %d → %d",
-                avg_write_time, old_workers, self.current_workers
-            )
-        elif avg_write_time < self.fast_threshold and self.current_workers < self.max_workers:
-            # NAS is fast, increase workers
-            self.current_workers = min(self.max_workers, math.ceil(self.current_workers * self.scale_up_factor))
-            if self.current_workers != old_workers:
-                LOGGER.info(
-                    "Adaptive throttle: NAS fast (avg %.3fs), increasing workers %d → %d",
-                    avg_write_time, old_workers, self.current_workers
-                )
-
-    def get_workers(self) -> int:
-        """Get current worker count."""
-        with self.lock:
-            return self.current_workers if self.enabled else self.max_workers
 
 
 # -------------------- Small helpers --------------------
@@ -973,7 +888,7 @@ def _compare_tree_quick(series_root: Path, expected_count: int, want_nfos: bool)
 
 # -------------------- Generators --------------------
 
-def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, category_name: str = "Uncategorised") -> None:
+def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UMovieRelation, dry_run: bool = False, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, category_name: str = "Uncategorised") -> None:
     raw_name = movie.name or ""
     movie_name = _clean_name(raw_name, clean_regex)
     movie_year = getattr(movie, "year", None)
@@ -1004,26 +919,20 @@ def _make_movie_strm_and_nfo(movie: Movie, base_url: str, root: Path, write_nfos
         if stream_id:
             url = f"{url}?stream_id={stream_id}"
 
-    start_time = time.time()
     wrote, reason = _write_strm_if_changed(strm_path, str(movie.uuid), url, manifest, "movie", dry_run)
-    if wrote and throttle:
-        throttle.record_write(time.time() - start_time)
 
     with lock:
         report_rows.append(["movie", "", "", raw_name, getattr(movie, "year", ""), str(movie.uuid), str(strm_path), "", "written" if wrote else "skipped", reason])
 
     if write_nfos and not dry_run:
-        nfo_start = time.time()
         nfo_path = m_folder / "movie.nfo"
         nfo_bytes = _nfo_movie(movie, clean_name=movie_name, relation=relation)
         wrote_nfo, nfo_reason = _write_if_changed(nfo_path, nfo_bytes)
-        if wrote_nfo and throttle:
-            throttle.record_write(time.time() - nfo_start)
         with lock:
             report_rows.append(["movie_nfo", "", "", raw_name, movie_year or "", str(movie.uuid), "", str(nfo_path), "written" if wrote_nfo else "skipped", nfo_reason])
 
 
-def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, throttle: AdaptiveThrottle | None = None, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, series_category: str = "Uncategorised") -> None:
+def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, root: Path, write_nfos: bool, report_rows: List[List[str]], lock: threading.Lock, manifest: Dict[str, Any], relation: M3UEpisodeRelation, dry_run: bool = False, written_seasons: set | None = None, written_tvshows: set | None = None, clean_regex: str | None = None, use_direct_urls: bool = False, provider_suffix: Optional[str] = None, series_category: str = "Uncategorised") -> None:
     # Workaround for Dispatcharr issue #556: Validate episode still exists before writing
     # Episodes can disappear mid-generation due to sync conflicts
     try:
@@ -1077,11 +986,7 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
         if stream_id:
             url = f"{url}?stream_id={stream_id}"
 
-    # Time the write operation for adaptive throttling
-    start_time = time.time()
     wrote, reason = _write_strm_if_changed(strm_path, str(episode.uuid), url, manifest, "episode", dry_run)
-    if wrote and throttle:
-        throttle.record_write(time.time() - start_time)
 
     title = getattr(episode, "name", "") or ""
     with lock:
@@ -1101,13 +1006,10 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
             should_write_tvshow = True
 
         if should_write_tvshow:
-            tvshow_start = time.time()
             tvshow_nfo_path = s_folder / "tvshow.nfo"
             clean_series_name = _clean_name(series.name or "", clean_regex)
             tvshow_nfo_bytes = _nfo_tvshow(series, clean_name=clean_series_name)
             wrote_tv, reason_tv = _write_if_changed(tvshow_nfo_path, tvshow_nfo_bytes)
-            if wrote_tv and throttle:
-                throttle.record_write(time.time() - tvshow_start)
             with lock:
                 report_rows.append(["tvshow_nfo", series.name or "", "", "", getattr(series, "year", ""), str(series.uuid), "", str(tvshow_nfo_path), "written" if wrote_tv else "skipped", reason_tv])
 
@@ -1125,23 +1027,17 @@ def _make_episode_strm_and_nfo(series: Series, episode: Episode, base_url: str, 
             should_write_season = True
 
         if should_write_season:
-            season_start = time.time()
             season_nfo_path = e_folder / "season.nfo"
             season_nfo_bytes = _nfo_season(series, season_number, clean_series_name=_clean_name(series.name or "", clean_regex))
             wrote_s, reason_s = _write_if_changed(season_nfo_path, season_nfo_bytes)
-            if wrote_s and throttle:
-                throttle.record_write(time.time() - season_start)
             with lock:
                 report_rows.append(["season_nfo", series.name or "", season_number, "", getattr(series, "year", ""), "", "", str(season_nfo_path), "written" if wrote_s else "skipped", reason_s])
 
         # episode nfo
-        ep_start = time.time()
         ep_nfo_path = e_folder / _episode_nfo_filename(episode)
         episode_name = _clean_name(getattr(episode, "name", "") or "", clean_regex)
         ep_nfo_bytes = _nfo_episode(episode, clean_name=episode_name, series_name=series.name, relation=relation)
         wrote_e, reason_e = _write_if_changed(ep_nfo_path, ep_nfo_bytes)
-        if wrote_e and throttle:
-            throttle.record_write(time.time() - ep_start)
         with lock:
             report_rows.append(["episode_nfo", series.name or "", season_number, title, getattr(series, "year", ""), str(episode.uuid), "", str(ep_nfo_path), "written" if wrote_e else "skipped", reason_e])
 
@@ -1314,17 +1210,15 @@ def _run_job_sync(
     base_url: str,
     write_nfos: bool,
     cleanup_mode: str,
-    concurrency: int,
     debug_logging: bool = False,
     dry_run: bool = False,
-    adaptive_throttle: bool = True,
     clean_regex: str | None = None,
     use_direct_urls: bool = False,
     multi_provider_mode: bool = False,
 ) -> None:
     _configure_file_logger(debug_logging)
-    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s multi_provider=%s",
-                mode, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+    LOGGER.info("RUN START mode=%s root=%s base_url=%s nfos=%s cleanup=%s dry_run=%s regex=%s direct_urls=%s multi_provider=%s",
+                mode, output_root, base_url, write_nfos, cleanup_mode, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
 
     root = Path(output_root)
     ts = _ts()
@@ -1346,10 +1240,10 @@ def _run_job_sync(
                     LOGGER.info("Manifest saved after cleanup with %d tracked files", len(manifest.get("files", {})))
 
         if mode in ("movies", "all"):
-            _generate_movies(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            _generate_movies(rows, base_url, root, write_nfos, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
 
         if mode in ("series", "all"):
-            _generate_series(rows, base_url, root, write_nfos, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            _generate_series(rows, base_url, root, write_nfos, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
 
         if mode == "stats":
             _stats_only(rows, base_url, root, write_nfos)
@@ -1366,9 +1260,25 @@ def _run_job_sync(
     LOGGER.info("RUN END mode=%s -> report=%s", mode, report_path)
 
 
-def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
-    LOGGER.info("Scanning movies... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
-                dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+def _run_batch(job, batch) -> None:
+    """
+    Run `job` over each item in `batch`, sequentially in the calling greenlet.
+
+    Generation is intentionally single-threaded. Dispatcharr's DB backend is
+    django_db_geventpool (a gevent connection pool over psycopg3); pooled
+    connections are greenlet-affine, so doing DB work in a ThreadPoolExecutor
+    worker thread raises "This operation would block forever" and the per-item
+    job dies after writing the .strm but before its movie.nfo — leaving Jellyfin
+    with no <uniqueid> to match on. Sequential greenlet-local DB access is the
+    only safe model here (the sibling VOD2MLIB plugin runs the same way).
+    """
+    for item in batch:
+        job(item)
+
+
+def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, dry_run: bool = False, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
+    LOGGER.info("Scanning movies... (dry_run=%s, regex=%s, direct_urls=%s, multi_provider=%s)",
+                dry_run, clean_regex, use_direct_urls, multi_provider_mode)
     # Get all movies with active provider relations
     # Prefetch ALL active relations (not just highest priority) to generate STRM files for all providers
     active_movie_relations = M3UMovieRelation.objects.filter(
@@ -1389,13 +1299,11 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Load manifest for caching
     manifest = _load_manifest(root)
     lock = threading.Lock()
-    throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
 
-    # Process in batches to allow adaptive concurrency adjustments
+    # Process in batches (sequential — see _run_batch for why no threads)
     batch_size = 100
     for i in range(0, len(all_movies), batch_size):
         batch = all_movies[i:i + batch_size]
-        current_workers = throttle.get_workers()
 
         def job(m: Movie) -> None:
             try:
@@ -1427,7 +1335,7 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
 
                     _make_movie_strm_and_nfo(
                         m, base_url, root, write_nfo_for_this, rows, lock, manifest,
-                        relation, dry_run, throttle, clean_regex, use_direct_urls, provider_suffix,
+                        relation, dry_run, clean_regex, use_direct_urls, provider_suffix,
                         category_name=cat_name
                     )
             except Exception as e:
@@ -1435,11 +1343,10 @@ def _generate_movies(rows: List[List[str]], base_url: str, root: Path, write_nfo
                 with lock:
                     rows.append(["movie", "", "", m.name or "", getattr(m, "year", ""), str(m.uuid), "", "", "error", str(e)])
 
-        with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
-            list(ex.map(job, batch))
+        _run_batch(job, batch)
 
         # Log progress every batch
-        LOGGER.info("Movies: processed %d / %d (current workers: %d)", min(i + batch_size, len(all_movies)), len(all_movies), current_workers)
+        LOGGER.info("Movies: processed %d / %d", min(i + batch_size, len(all_movies)), len(all_movies))
 
     # Save manifest after all writes (skip in dry run)
     if not dry_run:
@@ -1620,9 +1527,9 @@ def _maybe_internal_refresh_series(series: Series) -> bool:
         return False
 
 
-def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
-    LOGGER.info("Scanning series... (dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s, multi_provider=%s)", 
-                dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfos: bool, dry_run: bool = False, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False) -> None:
+    LOGGER.info("Scanning series... (dry_run=%s, regex=%s, direct_urls=%s, multi_provider=%s)",
+                dry_run, clean_regex, use_direct_urls, multi_provider_mode)
     # Only generate .strm files for series with active provider relations
     # Prefetch series relations to get category for directory structure
     active_series_relations = M3USeriesRelation.objects.filter(
@@ -1647,8 +1554,6 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
     # Track written seasons and tvshows to avoid duplicate NFO writes
     written_seasons = set()
     written_tvshows = set()
-
-    throttle = AdaptiveThrottle(max_workers=concurrency, enabled=adaptive_throttle)
 
     for s in series_qs.iterator(chunk_size=200):
         try:
@@ -1717,11 +1622,10 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                     rows.append(["series", s.name or "", "", "", getattr(s, "year", ""), str(s.uuid), str(series_folder), "", "skipped", "no_episodes"])
                 continue
 
-            # Process episodes in batches with adaptive concurrency
+            # Process episodes in batches (sequential — see _run_batch)
             batch_size = 100
             for i in range(0, len(eps), batch_size):
                 batch = eps[i:i + batch_size]
-                current_workers = throttle.get_workers()
 
                 def job(e: Episode) -> None:
                     try:
@@ -1752,7 +1656,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                             
                             _make_episode_strm_and_nfo(
                                 s, e, base_url, root, write_nfo_for_this, rows, lock, manifest,
-                                relation, dry_run, throttle, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix,
+                                relation, dry_run, written_seasons, written_tvshows, clean_regex, use_direct_urls, provider_suffix,
                                 series_category=s_cat_name
                             )
                     except Exception as ep_error:
@@ -1760,8 +1664,7 @@ def _generate_series(rows: List[List[str]], base_url: str, root: Path, write_nfo
                         with lock:
                             rows.append(["episode", s.name or "", getattr(e, "season_number", 0) or 0, getattr(e, "name", "") or "", getattr(s, "year", ""), str(e.uuid), "", "", "error", str(ep_error)])
 
-                with ThreadPoolExecutor(max_workers=max(1, current_workers)) as ex:
-                    list(ex.map(job, batch))
+                _run_batch(job, batch)
 
         except Exception as e:
             LOGGER.warning("Series id=%s failed: %s", getattr(s, "id", "?"), e)
@@ -2079,20 +1982,6 @@ class Plugin:
             "default": CLEANUP_OFF,
         },
         {
-            "id": "concurrency",
-            "label": "Max Filesystem Concurrency",
-            "type": "number",
-            "default": 4,
-            "help": "Maximum concurrent file operations (adaptive throttling will adjust based on NAS performance). Lower values protect slower storage.",
-        },
-        {
-            "id": "adaptive_throttle",
-            "label": "Adaptive Throttling",
-            "type": "boolean",
-            "default": True,
-            "help": "Automatically reduce concurrency when NAS is slow, increase when fast. Protects against I/O overload.",
-        },
-        {
             "id": "auto_run_after_vod_refresh",
             "label": "Auto-run after VOD Refresh",
             "type": "boolean",
@@ -2202,15 +2091,13 @@ class Plugin:
         base_url = settings.get("base_url") or DEFAULT_BASE_URL
         write_nfos = bool(settings.get("write_nfos", True))
         cleanup_mode = settings.get("cleanup_mode", CLEANUP_OFF)
-        concurrency = int(settings.get("concurrency") or 4)
         dry_run = bool(settings.get("dry_run", False))
-        adaptive_throttle = bool(settings.get("adaptive_throttle", True))
         clean_regex = (settings.get("name_clean_regex") or "").strip() or None
         use_direct_urls = bool(settings.get("use_direct_urls", False))
         multi_provider_mode = bool(settings.get("multi_provider_mode", False))
 
-        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s conc=%s dry_run=%s adaptive=%s regex=%s direct_urls=%s multi_provider=%s",
-                    action, output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+        LOGGER.info("Action '%s' | root=%s base_url=%s nfos=%s cleanup=%s dry_run=%s regex=%s direct_urls=%s multi_provider=%s",
+                    action, output_root, base_url, write_nfos, cleanup_mode, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
 
         _ensure_dirs()
         output_root.mkdir(parents=True, exist_ok=True)
@@ -2234,34 +2121,32 @@ class Plugin:
                 return {"status": "error", "message": f"Failed to delete episodes: {e}"}
 
         if action == "stats":
-            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            self._enqueue("stats", output_root, base_url, write_nfos, cleanup_mode, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
             return {"status": "ok", "message": "Stats job queued. See CSVs in /data/plugins/vod2strm/reports/."}
         if action == "generate_movies":
-            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            self._enqueue("movies", output_root, base_url, write_nfos, cleanup_mode, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
             msg = "Generate Movies job queued (DRY RUN - no files will be written)." if dry_run else "Generate Movies job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_series":
-            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            self._enqueue("series", output_root, base_url, write_nfos, cleanup_mode, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
             msg = "Generate Series job queued (DRY RUN - no files will be written)." if dry_run else "Generate Series job queued."
             return {"status": "ok", "message": msg}
         if action == "generate_all":
-            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, concurrency, dry_run, adaptive_throttle, clean_regex, use_direct_urls, multi_provider_mode)
+            self._enqueue("all", output_root, base_url, write_nfos, cleanup_mode, dry_run, clean_regex, use_direct_urls, multi_provider_mode)
             msg = "Generate All job queued (DRY RUN - no files will be written)." if dry_run else "Generate All job queued."
             return {"status": "ok", "message": msg}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 
-    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, concurrency: int, dry_run: bool = False, adaptive_throttle: bool = True, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False):
+    def _enqueue(self, mode, output_root: Path, base_url: str, write_nfos: bool, cleanup_mode: str, dry_run: bool = False, clean_regex: str | None = None, use_direct_urls: bool = False, multi_provider_mode: bool = False):
         args = {
             "mode": mode,
             "output_root": str(output_root),
             "base_url": base_url,
             "write_nfos": write_nfos,
             "cleanup_mode": cleanup_mode,
-            "concurrency": concurrency,
             "debug_logging": LOGGER.level <= logging.DEBUG,
             "dry_run": dry_run,
-            "adaptive_throttle": adaptive_throttle,
             "clean_regex": clean_regex,
             "use_direct_urls": use_direct_urls,
             "multi_provider_mode": multi_provider_mode,
@@ -2289,19 +2174,43 @@ class Plugin:
             "from vod2strm.plugin import _run_job_sync; "
             "_run_job_sync(**json.loads(os.environ['VOD2STRM_JOB_ARGS']))"
         )
+        # Capture the child's stdout/stderr to a file rather than DEVNULL: a
+        # failing child (bad interpreter, import error, etc.) would otherwise
+        # die invisibly and the queued job silently never runs. The file logger
+        # inside _run_job_sync handles the normal run log; this catches
+        # everything *before* that point.
+        try:
+            _ensure_dirs()
+            child_log = open(Path(LOG_ROOT) / "detached.log", "ab", buffering=0)
+        except Exception:
+            child_log = subprocess.DEVNULL
+        # Resolve the interpreter robustly. Dispatcharr serves the Django HTTP
+        # API under uWSGI (embedded Python), where `sys.executable` is the
+        # *uwsgi binary*, not python. Execing that with `manage.py shell ...`
+        # makes uWSGI try to parse manage.py as its own config and die with
+        # "unable to load configuration from manage.py" before the job runs —
+        # the queued generation then silently never happens. `sys.prefix`
+        # always resolves to the venv root, so derive the real interpreter from
+        # it and fall back to sys.executable only if absent.
+        py = sys.executable
+        if not (py and os.path.basename(py).startswith("python") and os.path.exists(py)):
+            cand = os.path.join(sys.prefix, "bin", "python")
+            py = cand if os.path.exists(cand) else py
         try:
             subprocess.Popen(
-                [sys.executable, "manage.py", "shell", "-c", runner],
+                [py, "manage.py", "shell", "-c", runner],
                 cwd="/app",
                 env=dict(os.environ, VOD2STRM_JOB_ARGS=json.dumps(args)),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=child_log,
+                stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
             )
             LOGGER.info(
-                "Launched detached STRM generation (mode=%s, dry_run=%s, adaptive=%s, regex=%s, direct_urls=%s)",
-                mode, dry_run, adaptive_throttle, clean_regex, use_direct_urls,
+                "Launched detached STRM generation (mode=%s, dry_run=%s, regex=%s, direct_urls=%s) "
+                "[interp=%s sys.executable=%s sys.argv0=%s]",
+                mode, dry_run, clean_regex, use_direct_urls,
+                py, sys.executable, (sys.argv[0] if sys.argv else None),
             )
         except Exception as e:
             LOGGER.error("Failed to launch detached generation subprocess: %s", e, exc_info=True)
@@ -2356,8 +2265,6 @@ if shared_task is not None:
                 base_url=settings.get("base_url") or DEFAULT_BASE_URL,
                 write_nfos=bool(settings.get("write_nfos", True)),
                 cleanup_mode=settings.get("cleanup_mode", CLEANUP_OFF),
-                concurrency=int(settings.get("concurrency", 4)),
-                adaptive_throttle=bool(settings.get("adaptive_throttle", True)),
                 debug_logging=bool(settings.get("debug_logging", False)),
                 dry_run=False,  # Scheduled runs always run for real
                 clean_regex=(settings.get("name_clean_regex") or "").strip() or None,
@@ -2462,10 +2369,8 @@ def _schedule_auto_run_after_vod_refresh():
                         base_url=current_settings.get("base_url") or DEFAULT_BASE_URL,
                         write_nfos=bool(current_settings.get("write_nfos", True)),
                         cleanup_mode=current_settings.get("cleanup_mode", CLEANUP_OFF),
-                        concurrency=int(current_settings.get("concurrency") or 4),
                         debug_logging=bool(current_settings.get("debug_logging", False)),
                         dry_run=False,
-                        adaptive_throttle=bool(current_settings.get("adaptive_throttle", True)),
                         clean_regex=(current_settings.get("name_clean_regex") or "").strip() or None,
                         use_direct_urls=bool(current_settings.get("use_direct_urls", False)),
                         multi_provider_mode=bool(current_settings.get("multi_provider_mode", False)),
